@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::{self};
+use std::{collections::HashMap, io};
 
 #[derive(Serialize, Deserialize)]
 struct Message<B> {
@@ -71,9 +71,9 @@ struct TopologyBody {
     msg_type: String,
     msg_id: Option<usize>,
     in_reply_to: Option<usize>,
-    // topology: Option<Topology>, but we don't care for now
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology: Option<HashMap<String, Vec<String>>>,
 }
-
 #[derive(Serialize, Deserialize)]
 struct ErrorBody {
     #[serde(rename = "type")]
@@ -88,6 +88,7 @@ fn main() {
     let mut id_idx = 0;
     let mut msg_idx = 1;
     let mut broadcast_messages: Vec<usize> = Vec::new();
+    let mut neighbors: Vec<String> = Vec::new();
 
     loop {
         let mut input = String::new();
@@ -162,8 +163,6 @@ fn main() {
             "broadcast" => {
                 let input_msg: Message<BroadcastBody> = serde_json::from_str(&input).unwrap();
 
-                broadcast_messages.push(input_msg.body.message.unwrap());
-
                 let output_msg = Message {
                     src: input_msg.dest,
                     dest: input_msg.src,
@@ -178,6 +177,30 @@ fn main() {
                 let output = serde_json::to_string(&output_msg).unwrap();
                 println!("{}", output);
                 eprintln!("output: {}", output);
+
+                if broadcast_messages.contains(&input_msg.body.message.unwrap()) {
+                    continue;
+                }
+
+                broadcast_messages.push(input_msg.body.message.unwrap());
+
+                // broadcast to neighbors
+                for neighbor in neighbors.iter() {
+                    let output_msg = Message {
+                        src: node_id.clone(),
+                        dest: neighbor.clone(),
+                        body: BroadcastBody {
+                            msg_type: "broadcast".to_string(),
+                            msg_id: None, // Inter-server messages don't have a msg_id, and don't need a response
+                            in_reply_to: None,
+                            message: Some(input_msg.body.message.unwrap()),
+                        },
+                    };
+
+                    let output = serde_json::to_string(&output_msg).unwrap();
+                    println!("{}", output);
+                    eprintln!("output: {}", output);
+                }
             }
             "read" => {
                 let input_msg: Message<ReadBody> = serde_json::from_str(&input).unwrap();
@@ -200,6 +223,14 @@ fn main() {
             "topology" => {
                 let input_msg: Message<TopologyBody> = serde_json::from_str(&input).unwrap();
 
+                neighbors = input_msg
+                    .body
+                    .topology
+                    .unwrap()
+                    .get(&node_id)
+                    .unwrap()
+                    .clone();
+
                 let output_msg = Message {
                     src: input_msg.dest,
                     dest: input_msg.src,
@@ -207,12 +238,16 @@ fn main() {
                         msg_type: "topology_ok".to_string(),
                         in_reply_to: input_msg.body.msg_id,
                         msg_id: Some(msg_idx),
+                        topology: None,
                     },
                 };
 
                 let output = serde_json::to_string(&output_msg).unwrap();
                 println!("{}", output);
                 eprintln!("output: {}", output);
+            }
+            "broadcast_ok" => {
+                // Do nothing
             }
 
             _ => {
