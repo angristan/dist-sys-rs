@@ -33,7 +33,19 @@ struct InitBody {
     node_ids: Option<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct GenerateBody {
+    #[serde(rename = "type")]
+    msg_type: String,
+    id: Option<String>,
+    msg_id: Option<usize>,
+    in_reply_to: Option<usize>,
+}
+
 fn main() {
+    let mut node_id = String::new();
+    let mut id_idx = 0;
+
     loop {
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
@@ -61,6 +73,8 @@ fn main() {
             "init" => {
                 let input_msg: Message<InitBody> = serde_json::from_str(&input).unwrap();
 
+                node_id = input_msg.body.node_id.unwrap();
+
                 let output_msg = Message {
                     src: input_msg.dest,
                     dest: input_msg.src,
@@ -71,6 +85,26 @@ fn main() {
                         node_id: None,
                         node_ids: None,
                         msg_id: None,
+                    },
+                };
+
+                let output = serde_json::to_string(&output_msg).unwrap();
+                println!("{}", output);
+            }
+            "generate" => {
+                let input_msg: Message<GenerateBody> = serde_json::from_str(&input).unwrap();
+
+                let id = format!("{}-{}", node_id, id_idx);
+                id_idx += 1;
+
+                let output_msg = Message {
+                    src: input_msg.dest,
+                    dest: input_msg.src,
+                    body: GenerateBody {
+                        msg_type: "generate_ok".to_string(),
+                        id: Some(id),
+                        msg_id: input_msg.body.msg_id,
+                        in_reply_to: input_msg.body.msg_id,
                     },
                 };
 
