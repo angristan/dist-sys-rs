@@ -6,7 +6,7 @@ use std::{
 };
 use tokio::task;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Message<B> {
     src: String,
     dest: String,
@@ -51,7 +51,7 @@ struct GenerateBody {
     in_reply_to: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct BroadcastBody {
     #[serde(rename = "type")]
     msg_type: String,
@@ -197,7 +197,9 @@ async fn network_handler(
     node_id_chan_receiver: flume::Receiver<String>,
     in_topology_chan_receiver: flume::Receiver<Message<TopologyBody>>,
     in_broadcast_chan_receiver: flume::Receiver<Message<BroadcastBody>>,
+    in_broadcast_ok_chan_receiver: flume::Receiver<Message<BroadcastBody>>,
     in_read_chan_receiver: flume::Receiver<Message<ReadBody>>,
+    unack_tick_receiver: flume::Receiver<()>,
     stdout_chan_sender: flume::Sender<String>,
     atomic_counter: Arc<AtomicUsize>,
 ) {
@@ -210,6 +212,11 @@ async fn network_handler(
         node_id = msg;
         break;
     }
+
+    // Maps used to store unack broadcast messages
+    let unack_msg_id_to_value: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
+    let unack_neighboor_to_value_to_msg_ids: Mutex<HashMap<String, HashMap<usize, Vec<usize>>>> =
+        Mutex::new(HashMap::new());
 
     loop {
         flume::Selector::new()
@@ -279,7 +286,7 @@ async fn network_handler(
                         dest: neighbor.clone(),
                         body: BroadcastBody {
                             msg_type: "broadcast".to_string(),
-                            msg_id: None, // Inter-server messages don't have a msg_id, and don't need a response
+                            msg_id: Some(atomic_increment(&atomic_counter)),
                             in_reply_to: None,
                             message: Some(input_msg.body.message.unwrap()),
                         },
@@ -287,6 +294,22 @@ async fn network_handler(
 
                     let output = serde_json::to_string(&output_msg).unwrap();
                     stdout_chan_sender.send(output).unwrap();
+
+                    // Store msg_id to be able to re-broadcast until we receive broadcast_ok
+
+                    unack_msg_id_to_value.lock().unwrap().insert(
+                        output_msg.body.msg_id.unwrap(),
+                        input_msg.body.message.unwrap(),
+                    );
+
+                    unack_neighboor_to_value_to_msg_ids
+                        .lock()
+                        .unwrap()
+                        .entry(neighbor.clone())
+                        .or_insert(HashMap::new())
+                        .entry(input_msg.body.message.unwrap())
+                        .or_insert(Vec::new())
+                        .push(output_msg.body.msg_id.unwrap());
                 }
             })
             .recv(&in_read_chan_receiver, |input_msg| {
@@ -307,6 +330,76 @@ async fn network_handler(
                 let output = serde_json::to_string(&output_msg).unwrap();
                 stdout_chan_sender.send(output).unwrap();
             })
+            .recv(&in_broadcast_ok_chan_receiver, |input_msg| {
+                let input_msg = input_msg.unwrap();
+
+                let guard = unack_msg_id_to_value.lock().unwrap();
+                let value = guard
+                    .get(&input_msg.body.in_reply_to.unwrap())
+                    .cloned()
+                    .unwrap();
+                drop(guard); // release lock
+
+                // Remove the message id from the map
+                unack_msg_id_to_value
+                    .lock()
+                    .unwrap()
+                    .remove(&input_msg.body.in_reply_to.unwrap());
+
+                // Remove value from the neighbor map
+                unack_neighboor_to_value_to_msg_ids
+                    .lock()
+                    .unwrap()
+                    .get_mut(&input_msg.src)
+                    .unwrap()
+                    .remove(&value);
+            })
+            .recv(&unack_tick_receiver, |_| {
+                let mut msg_ids_to_insert: Vec<(String, usize, usize)> = Vec::new();
+
+                // Resend all unack broadcast messages
+                for (neighbor, value_to_msg_ids) in
+                    unack_neighboor_to_value_to_msg_ids.lock().unwrap().iter()
+                {
+                    for (value, _) in value_to_msg_ids.iter() {
+                        let output_msg = Message {
+                            src: node_id.clone(),
+                            dest: neighbor.clone(),
+                            body: BroadcastBody {
+                                msg_type: "broadcast".to_string(),
+                                msg_id: Some(atomic_increment(&atomic_counter)),
+                                in_reply_to: None,
+                                message: Some(*value),
+                            },
+                        };
+
+                        let output = serde_json::to_string(&output_msg).unwrap();
+                        stdout_chan_sender.send(output).unwrap();
+
+                        unack_msg_id_to_value
+                            .lock()
+                            .unwrap()
+                            .insert(output_msg.body.msg_id.unwrap(), *value);
+
+                        msg_ids_to_insert.push((
+                            neighbor.clone(),
+                            *value,
+                            output_msg.body.msg_id.unwrap(),
+                        ));
+                    }
+                }
+
+                for (neighbor, value, msg_id) in msg_ids_to_insert {
+                    unack_neighboor_to_value_to_msg_ids
+                        .lock()
+                        .unwrap()
+                        .entry(neighbor)
+                        .or_insert(HashMap::new())
+                        .entry(value)
+                        .or_insert(Vec::new())
+                        .push(msg_id);
+                }
+            })
             .wait();
     }
 }
@@ -323,6 +416,9 @@ async fn main() {
     let (in_broadcast_chan_sender, in_broadcast_chan_receiver) = flume::unbounded();
     let (in_read_chan_sender, in_read_chan_receiver) = flume::unbounded();
     let (in_topology_chan_sender, in_topology_chan_receiver) = flume::unbounded();
+    let (in_broadcast_ok_chan_sender, in_broadcast_ok_chan_receiver) = flume::unbounded();
+
+    let (unac_tick_sender, unack_tick_receiver) = flume::unbounded();
 
     // We need two channels for node_id because we need to send it to two different handlers
     // And from the docs: "Note: Cloning the receiver *does not* turn this channel into a broadcast channel. Each message will only be received by a single receiver." :(
@@ -380,11 +476,21 @@ async fn main() {
             node_id_for_network_chan_receiver,
             in_topology_chan_receiver,
             in_broadcast_chan_receiver,
+            in_broadcast_ok_chan_receiver,
             in_read_chan_receiver,
+            unack_tick_receiver,
             stdout_chan_sender_clone,
             atomic_counter_clone,
         )
         .await;
+    });
+
+    // Periodically send a tick, which will trigger unack broadcast to be resent
+    tokio::spawn(async move {
+        loop {
+            unac_tick_sender.send(()).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
     });
 
     loop {
@@ -421,7 +527,8 @@ async fn main() {
                 in_topology_chan_sender.send(input_msg).unwrap();
             }
             "broadcast_ok" => {
-                // Do nothing
+                let input_msg: Message<BroadcastBody> = serde_json::from_str(&input).unwrap();
+                in_broadcast_ok_chan_sender.send(input_msg).unwrap();
             }
 
             _ => {
