@@ -250,6 +250,7 @@ async fn network_handler(
             })
             .recv(&in_broadcast_chan_receiver, |input_msg| {
                 let input_msg = input_msg.unwrap();
+                let src = input_msg.src.clone();
 
                 let output_msg = Message {
                     src: input_msg.dest,
@@ -281,6 +282,11 @@ async fn network_handler(
 
                 // broadcast to neighbors
                 for neighbor in neighbors.lock().unwrap().iter() {
+                    // Don't broadcast back to the sender
+                    if neighbor == &src {
+                        continue;
+                    }
+
                     let output_msg = Message {
                         src: node_id.clone(),
                         dest: neighbor.clone(),
