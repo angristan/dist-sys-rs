@@ -6,7 +6,7 @@ use std::{
 };
 use tokio::task;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message<B> {
     src: String,
     dest: String,
@@ -51,7 +51,7 @@ struct GenerateBody {
     in_reply_to: Option<usize>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct BroadcastBody {
     #[serde(rename = "type")]
     msg_type: String,
@@ -59,6 +59,16 @@ struct BroadcastBody {
     in_reply_to: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages: Option<Vec<usize>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BroadcastOKBody {
+    #[serde(rename = "type")]
+    msg_type: String,
+    msg_id: Option<usize>,
+    in_reply_to: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,6 +105,7 @@ fn atomic_increment(counter: &Arc<AtomicUsize>) -> usize {
 async fn stdout_handler(stdout_chan_receiver: &flume::Receiver<String>) {
     for msg in stdout_chan_receiver.iter() {
         println!("{}", msg);
+        eprintln!("output: {}", msg)
     }
 }
 
@@ -214,7 +225,7 @@ async fn network_handler(
     }
 
     // Maps used to store unack broadcast messages
-    let unack_msg_id_to_value: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
+    let unack_msg_id_to_values: Mutex<HashMap<usize, Vec<usize>>> = Mutex::new(HashMap::new());
     let unack_neighboor_to_value_to_msg_ids: Mutex<HashMap<String, HashMap<usize, Vec<usize>>>> =
         Mutex::new(HashMap::new());
 
@@ -255,30 +266,36 @@ async fn network_handler(
                 let output_msg = Message {
                     src: input_msg.dest,
                     dest: input_msg.src,
-                    body: BroadcastBody {
+                    body: BroadcastOKBody {
                         msg_type: "broadcast_ok".to_string(),
                         msg_id: Some(atomic_increment(&atomic_counter)),
                         in_reply_to: input_msg.body.msg_id,
-                        message: None,
                     },
                 };
 
                 let output = serde_json::to_string(&output_msg).unwrap();
                 stdout_chan_sender.send(output).unwrap();
 
-                // If we've already seen this message, don't broadcast it again
-                if broadcast_messages
-                    .lock()
-                    .unwrap()
-                    .contains(&input_msg.body.message.unwrap())
-                {
-                    return;
+                let mut received_messages: Vec<usize> = Vec::new();
+                if let Some(messages) = input_msg.body.messages {
+                    received_messages.extend(messages);
                 }
+                if let Some(message) = input_msg.body.message {
+                    received_messages.push(message);
+                }
+
+                let mut new_messages = received_messages.clone();
+                new_messages.retain(|&x| !broadcast_messages.lock().unwrap().contains(&x));
 
                 broadcast_messages
                     .lock()
                     .unwrap()
-                    .push(input_msg.body.message.unwrap());
+                    .extend(new_messages.clone());
+
+                // If no new messages, return
+                if new_messages.is_empty() {
+                    return;
+                }
 
                 // broadcast to neighbors
                 for neighbor in neighbors.lock().unwrap().iter() {
@@ -294,28 +311,30 @@ async fn network_handler(
                             msg_type: "broadcast".to_string(),
                             msg_id: Some(atomic_increment(&atomic_counter)),
                             in_reply_to: None,
-                            message: Some(input_msg.body.message.unwrap()),
+                            message: None,
+                            messages: Some(new_messages.clone()),
                         },
                     };
 
-                    let output = serde_json::to_string(&output_msg).unwrap();
-                    stdout_chan_sender.send(output).unwrap();
-
                     // Store msg_id to be able to re-broadcast until we receive broadcast_ok
 
-                    unack_msg_id_to_value.lock().unwrap().insert(
-                        output_msg.body.msg_id.unwrap(),
-                        input_msg.body.message.unwrap(),
-                    );
+                    for message in new_messages.iter() {
+                        unack_msg_id_to_values
+                            .lock()
+                            .unwrap()
+                            .entry(output_msg.body.msg_id.unwrap())
+                            .or_insert(Vec::new())
+                            .push(*message);
 
-                    unack_neighboor_to_value_to_msg_ids
-                        .lock()
-                        .unwrap()
-                        .entry(neighbor.clone())
-                        .or_insert(HashMap::new())
-                        .entry(input_msg.body.message.unwrap())
-                        .or_insert(Vec::new())
-                        .push(output_msg.body.msg_id.unwrap());
+                        unack_neighboor_to_value_to_msg_ids
+                            .lock()
+                            .unwrap()
+                            .entry(neighbor.clone())
+                            .or_insert(HashMap::new())
+                            .entry(*message)
+                            .or_insert(Vec::new())
+                            .push(output_msg.body.msg_id.unwrap());
+                    }
                 }
             })
             .recv(&in_read_chan_receiver, |input_msg| {
@@ -339,57 +358,66 @@ async fn network_handler(
             .recv(&in_broadcast_ok_chan_receiver, |input_msg| {
                 let input_msg = input_msg.unwrap();
 
-                let guard = unack_msg_id_to_value.lock().unwrap();
-                let value = guard
+                let guard = unack_msg_id_to_values.lock().unwrap();
+                let values = guard
                     .get(&input_msg.body.in_reply_to.unwrap())
                     .cloned()
                     .unwrap();
                 drop(guard); // release lock
 
                 // Remove the message id from the map
-                unack_msg_id_to_value
+                unack_msg_id_to_values
                     .lock()
                     .unwrap()
                     .remove(&input_msg.body.in_reply_to.unwrap());
 
-                // Remove value from the neighbor map
+                // TODO: remove other message ids for the same value
+
+                // Remove values from unack_neighboor_to_value_to_msg_ids
+                for value in values.iter() {
+                    if let Some(value_to_msg_ids) = unack_neighboor_to_value_to_msg_ids
+                        .lock()
+                        .unwrap()
+                        .get_mut(&input_msg.src)
+                    {
+                        value_to_msg_ids.remove(&value);
+                    }
+                }
+
+                // if neighbor has no more unack messages, remove it from the map
                 unack_neighboor_to_value_to_msg_ids
                     .lock()
                     .unwrap()
-                    .get_mut(&input_msg.src)
-                    .unwrap()
-                    .remove(&value);
+                    .retain(|_, v| !v.is_empty());
             })
             .recv(&unack_tick_receiver, |_| {
                 let mut msg_ids_to_insert: Vec<(String, usize, usize)> = Vec::new();
+                let mut msgs_to_send: Vec<Message<BroadcastBody>> = Vec::new();
 
                 // Resend all unack broadcast messages
                 for (neighbor, value_to_msg_ids) in
                     unack_neighboor_to_value_to_msg_ids.lock().unwrap().iter()
                 {
-                    for (value, _) in value_to_msg_ids.iter() {
-                        let output_msg = Message {
-                            src: node_id.clone(),
-                            dest: neighbor.clone(),
-                            body: BroadcastBody {
-                                msg_type: "broadcast".to_string(),
-                                msg_id: Some(atomic_increment(&atomic_counter)),
-                                in_reply_to: None,
-                                message: Some(*value),
-                            },
-                        };
+                    let values = value_to_msg_ids.keys().cloned().collect::<Vec<usize>>();
 
-                        let output = serde_json::to_string(&output_msg).unwrap();
-                        stdout_chan_sender.send(output).unwrap();
+                    let output_msg = Message {
+                        src: node_id.clone(),
+                        dest: neighbor.clone(),
+                        body: BroadcastBody {
+                            msg_type: "broadcast".to_string(),
+                            msg_id: Some(atomic_increment(&atomic_counter)),
+                            in_reply_to: None,
+                            message: None,
+                            messages: Some(values.clone()),
+                        },
+                    };
 
-                        unack_msg_id_to_value
-                            .lock()
-                            .unwrap()
-                            .insert(output_msg.body.msg_id.unwrap(), *value);
+                    msgs_to_send.push(output_msg.clone());
 
+                    for value in values {
                         msg_ids_to_insert.push((
                             neighbor.clone(),
-                            *value,
+                            value,
                             output_msg.body.msg_id.unwrap(),
                         ));
                     }
@@ -404,6 +432,18 @@ async fn network_handler(
                         .entry(value)
                         .or_insert(Vec::new())
                         .push(msg_id);
+
+                    unack_msg_id_to_values
+                        .lock()
+                        .unwrap()
+                        .entry(msg_id)
+                        .or_insert(Vec::new())
+                        .push(value);
+                }
+
+                for msg in msgs_to_send.iter() {
+                    let output = serde_json::to_string(&msg).unwrap();
+                    stdout_chan_sender.send(output).unwrap();
                 }
             })
             .wait();
@@ -495,7 +535,7 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             unac_tick_sender.send(()).unwrap();
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     });
 
