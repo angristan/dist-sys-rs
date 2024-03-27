@@ -109,38 +109,35 @@ async fn stdout_handler(stdout_chan_receiver: &flume::Receiver<String>) {
     }
 }
 
-async fn init_handler(
-    in_init_chan_receiver: flume::Receiver<Message<InitBody>>,
-    node_id_for_generate_chan_sender: flume::Sender<String>,
-    node_id_for_network_chan_sender: flume::Sender<String>,
+fn init_handler(
     stdout_chan_sender: flume::Sender<String>,
     atomic_counter: Arc<AtomicUsize>,
-) {
-    for input_msg in in_init_chan_receiver.iter() {
-        let node_id = input_msg.body.node_id.unwrap();
+) -> String {
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read first line");
+    let input_msg: Message<InitBody> =
+        serde_json::from_str(&input).expect("Failed to parse first line as init message");
 
-        let output_msg = Message {
-            src: input_msg.dest,
-            dest: input_msg.src,
-            body: InitBody {
-                msg_type: "init_ok".to_string(),
-                in_reply_to: input_msg.body.msg_id,
-                msg_id: Some(atomic_increment(&atomic_counter)),
-                node_id: None,
-                node_ids: None,
-            },
-        };
+    let node_id = input_msg.body.node_id.unwrap();
 
-        node_id_for_generate_chan_sender
-            .send(node_id.clone())
-            .unwrap();
-        node_id_for_network_chan_sender
-            .send(node_id.clone())
-            .unwrap();
+    let output_msg = Message {
+        src: input_msg.dest,
+        dest: input_msg.src,
+        body: InitBody {
+            msg_type: "init_ok".to_string(),
+            in_reply_to: input_msg.body.msg_id,
+            msg_id: Some(atomic_increment(&atomic_counter)),
+            node_id: None,
+            node_ids: None,
+        },
+    };
 
-        let output = serde_json::to_string(&output_msg).unwrap();
-        stdout_chan_sender.send(output).unwrap();
-    }
+    let output = serde_json::to_string(&output_msg).unwrap();
+    stdout_chan_sender.send(output).unwrap();
+
+    node_id
 }
 
 async fn echo_handler(
@@ -166,19 +163,11 @@ async fn echo_handler(
 }
 
 async fn generate_handler(
+    node_id: String,
     in_generate_chan_receiver: flume::Receiver<Message<GenerateBody>>,
-    node_id_chan_receiver: flume::Receiver<String>,
     stdout_chan_sender: flume::Sender<String>,
     atomic_counter: Arc<AtomicUsize>,
 ) {
-    let mut node_id = String::new();
-
-    // Wait for node_id
-    for msg in node_id_chan_receiver.iter() {
-        node_id = msg;
-        break;
-    }
-
     let mut id_idx = 0;
 
     for input_msg in in_generate_chan_receiver.iter() {
@@ -205,7 +194,7 @@ async fn generate_handler(
 // network_handler is reponsible for handling topology messages
 // as well as broadcast/read messages and gossiping them to neighbors
 async fn network_handler(
-    node_id_chan_receiver: flume::Receiver<String>,
+    node_id: String,
     in_topology_chan_receiver: flume::Receiver<Message<TopologyBody>>,
     in_broadcast_chan_receiver: flume::Receiver<Message<BroadcastBody>>,
     in_broadcast_ok_chan_receiver: flume::Receiver<Message<BroadcastBody>>,
@@ -214,15 +203,8 @@ async fn network_handler(
     stdout_chan_sender: flume::Sender<String>,
     atomic_counter: Arc<AtomicUsize>,
 ) {
-    let mut node_id = String::new();
     let neighbors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let broadcast_messages: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-    // Wait for node_id
-    for msg in node_id_chan_receiver.iter() {
-        node_id = msg;
-        break;
-    }
 
     // Maps used to store unack broadcast messages
     let unack_msg_id_to_values: Mutex<HashMap<usize, Vec<usize>>> = Mutex::new(HashMap::new());
@@ -456,7 +438,6 @@ async fn main() {
 
     let (stdout_chan_sender, stdout_chan_receiver) = flume::unbounded();
 
-    let (in_init_chan_sender, in_init_chan_receiver) = flume::unbounded();
     let (in_echo_chan_sender, in_echo_chan_receiver) = flume::unbounded();
     let (in_generate_chan_sender, in_generate_chan_receiver) = flume::unbounded();
     let (in_broadcast_chan_sender, in_broadcast_chan_receiver) = flume::unbounded();
@@ -466,27 +447,11 @@ async fn main() {
 
     let (unac_tick_sender, unack_tick_receiver) = flume::unbounded();
 
-    // We need two channels for node_id because we need to send it to two different handlers
-    // And from the docs: "Note: Cloning the receiver *does not* turn this channel into a broadcast channel. Each message will only be received by a single receiver." :(
-    let (node_id_for_generate_chan_sender, node_id_for_generate_chan_receiver) = flume::unbounded();
-    let (node_id_for_network_chan_sender, node_id_for_network_chan_receiver) = flume::unbounded();
+    // The first message is always an init message, containing the node_id
+    let node_id = init_handler(stdout_chan_sender.clone(), Arc::clone(&atomic_counter));
 
     task::spawn(async move {
         stdout_handler(&stdout_chan_receiver).await;
-    });
-
-    let stdout_chan_sender_clone = stdout_chan_sender.clone();
-    let atomic_counter_clone = Arc::clone(&atomic_counter);
-
-    task::spawn(async move {
-        init_handler(
-            in_init_chan_receiver,
-            node_id_for_generate_chan_sender,
-            node_id_for_network_chan_sender,
-            stdout_chan_sender_clone,
-            atomic_counter_clone,
-        )
-        .await;
     });
 
     let stdout_chan_sender_clone = stdout_chan_sender.clone();
@@ -503,11 +468,12 @@ async fn main() {
 
     let stdout_chan_sender_clone = stdout_chan_sender.clone();
     let atomic_counter_clone = Arc::clone(&atomic_counter);
+    let node_id_clone = node_id.clone();
 
     task::spawn(async move {
         generate_handler(
+            node_id_clone,
             in_generate_chan_receiver,
-            node_id_for_generate_chan_receiver,
             stdout_chan_sender_clone,
             atomic_counter_clone,
         )
@@ -516,10 +482,11 @@ async fn main() {
 
     let stdout_chan_sender_clone = stdout_chan_sender.clone();
     let atomic_counter_clone = Arc::clone(&atomic_counter);
+    let node_id_clone = node_id.clone();
 
     task::spawn(async move {
         network_handler(
-            node_id_for_network_chan_receiver,
+            node_id_clone,
             in_topology_chan_receiver,
             in_broadcast_chan_receiver,
             in_broadcast_ok_chan_receiver,
@@ -548,10 +515,6 @@ async fn main() {
         let input_msg: Message<GenericBody> = serde_json::from_str(&input).unwrap();
 
         match input_msg.body.msg_type.as_str() {
-            "init" => {
-                let input_msg: Message<InitBody> = serde_json::from_str(&input).unwrap();
-                in_init_chan_sender.send(input_msg).unwrap();
-            }
             "echo" => {
                 let input_msg: Message<EchoBody> = serde_json::from_str(&input).unwrap();
                 in_echo_chan_sender.send(input_msg).unwrap();
